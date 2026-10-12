@@ -1,5 +1,6 @@
 """
 IntelliHire - AI CV Screening Service (Render-ready)
+Accepts cv_base64 (preferred) OR cv_path (for local testing).
 Provides: overall match, skills/education/experience subscores, recommendation
 """
 
@@ -8,6 +9,8 @@ import pdfplumber
 import docx
 import re
 import os
+import base64
+import tempfile
 from collections import Counter
 from math import log
 
@@ -85,6 +88,50 @@ def keyword_overlap(cv_tokens, job_tokens):
     matched = cv_set & job_set
     return len(matched) / len(job_set), sorted(matched)[:25]
 
+# ---------------- CV Text Loader ----------------
+def load_cv_text(data):
+    """
+    Priority:
+      1. cv_base64 + cv_filename  -> decode & extract (new PHP path)
+      2. cv_path                  -> read from local disk (for local testing)
+    Returns (text, error_message). On success, error_message is None.
+    """
+    # --- Option 1: base64 upload ---
+    if data.get("cv_base64"):
+        try:
+            raw = base64.b64decode(data["cv_base64"])
+        except Exception as e:
+            return "", f"base64 decode failed: {e}"
+
+        filename = data.get("cv_filename") or "cv.pdf"
+        ext = os.path.splitext(filename)[1].lower() or ".pdf"
+
+        # Write to a temp file so pdfplumber / python-docx can open it
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(raw)
+            text = extract_text(tmp_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+        return text, None
+
+    # --- Option 2: server-side path (local testing only) ---
+    cv_path = data.get("cv_path")
+    if cv_path:
+        if not os.path.isfile(cv_path):
+            return "", f"CV file not found at path: {cv_path}"
+        try:
+            return extract_text(cv_path), None
+        except Exception as e:
+            return "", f"CV extract failed: {e}"
+
+    return "", "Missing cv_base64 or cv_path"
+
 # ---------------- Endpoint ----------------
 @app.route("/screen", methods=["POST"])
 def screen():
@@ -92,14 +139,18 @@ def screen():
     if not data:
         return jsonify({"error": "Invalid JSON body"}), 400
 
-    cv_path = data.get("cv_path")
-    if not cv_path:
-        return jsonify({"error": "Missing cv_path"}), 400
-
-    try:
-        cv_text = extract_text(cv_path)
-    except Exception as e:
-        return jsonify({"error": f"CV extract failed: {e}"}), 500
+    cv_text, err = load_cv_text(data)
+    if err:
+        # Return a proper JSON response (200) with zero scores so PHP saves the application
+        return jsonify({
+            "match_score": 0,
+            "skills_score": 0,
+            "education_score": 0,
+            "experience_score": 0,
+            "recommendation": "Weak Match",
+            "matched_keywords": "",
+            "note": err
+        }), 200
 
     if not cv_text.strip():
         return jsonify({
